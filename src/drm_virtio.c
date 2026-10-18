@@ -77,15 +77,15 @@ struct vring_used_elem {
 } __attribute__((packed));
 
 struct vring_used {
-    uint16_t flags;
-    uint16_t idx;
+    volatile uint16_t flags;
+    volatile uint16_t idx;
     struct vring_used_elem ring[];
 } __attribute__((packed));
 
 struct virtio_vring_elem {
     struct vring_desc  *desc;
     struct vring_avail *avail;
-    struct vring_used  *used;
+    volatile struct vring_used  *used;
     uint16_t            size;
     uint16_t            last_used_idx;
     void               *raw_mem;
@@ -239,14 +239,15 @@ static int virtgpu_send_command(struct virtio_gpu_device *vgpu, void *cmd, size_
         v_out16(vgpu->io_base, VIRTIO_PCI_QUEUE_NOTIFY, 0);
     }
 
-    /* Wait for completion using real architectural timer (up to 2.0 seconds) */
+    /* Wait for completion using real architectural timer (up to 50 milliseconds) */
     uint64_t freq = virtgpu_read_timer_freq();
     if (freq == 0) freq = 62500000ULL;
-    uint64_t max_ticks = freq * 2; /* 2.0s */
+    uint64_t max_ticks = freq / 20; /* 50ms timeout */
     uint64_t start = virtgpu_read_timer();
     bool completed = false;
 
     while (virtgpu_read_timer() - start < max_ticks) {
+        smp_rmb();
         if (vq->used->idx != vq->last_used_idx) {
             completed = true;
             break;
