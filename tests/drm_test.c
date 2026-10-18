@@ -405,7 +405,6 @@ int cherry_drm_run_tests(void)
     bool mali_pass  = test_mali_panfrost_pipeline();
     bool prime_pass = test_prime_buffer_sharing();
     bool fb_pass    = test_fbdev_emulation();
-
     bool bifrost_pass = test_bifrost_display_and_tiler();
 
     bool all_pass = v_pass && c_pass && gem_pass && kms_pass &&

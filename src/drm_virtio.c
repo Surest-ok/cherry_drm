@@ -161,6 +161,25 @@ static int virtgpu_vring_setup(struct virtio_vring_elem *vq, uint16_t num)
     return 0;
 }
 
+/* Dedicated static DMA buffers outside task stack to prevent DMA trashing */
+static uint8_t s_dma_cmd_buf[4096] __attribute__((aligned(4096)));
+static uint8_t s_dma_resp_buf[4096] __attribute__((aligned(4096)));
+static spinlock_t s_cmd_lock = {0};
+
+static inline uint64_t virtgpu_read_timer(void)
+{
+    uint64_t val;
+    __asm__ volatile("mrs %0, cntpct_el0" : "=r"(val));
+    return val;
+}
+
+static inline uint64_t virtgpu_read_timer_freq(void)
+{
+    uint64_t val;
+    __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(val));
+    return val;
+}
+
 static int virtgpu_send_command(struct virtio_gpu_device *vgpu, void *cmd, size_t cmd_sz, void *resp, size_t resp_sz)
 {
     if (!vgpu) return -EINVAL;
@@ -176,18 +195,33 @@ static int virtgpu_send_command(struct virtio_gpu_device *vgpu, void *cmd, size_
         return 0;
     }
 
+    if (cmd_sz > sizeof(s_dma_cmd_buf) || resp_sz > sizeof(s_dma_resp_buf)) {
+        return -EINVAL;
+    }
+
+    unsigned long flags = 0;
+    spin_lock_irqsave(&s_cmd_lock, flags);
+
+    /* Copy request to dedicated DMA buffer (never on task stack) */
+    if (cmd && cmd_sz > 0) {
+        memcpy(s_dma_cmd_buf, cmd, cmd_sz);
+    }
+    if (resp && resp_sz > 0) {
+        memset(s_dma_resp_buf, 0, resp_sz);
+    }
+
     struct virtio_vring_elem *vq = &vgpu->ctrl_vq;
     uint16_t d0 = vq->avail->idx % vq->size;
     uint16_t d1 = (d0 + 1) % vq->size;
 
     /* Outgoing request buffer */
-    vq->desc[d0].addr = (uint64_t)(uintptr_t)cmd;
+    vq->desc[d0].addr = (uint64_t)(uintptr_t)s_dma_cmd_buf;
     vq->desc[d0].len = (uint32_t)cmd_sz;
     vq->desc[d0].flags = VRING_DESC_F_NEXT;
     vq->desc[d0].next = d1;
 
     /* Incoming response buffer */
-    vq->desc[d1].addr = (uint64_t)(uintptr_t)resp;
+    vq->desc[d1].addr = (uint64_t)(uintptr_t)s_dma_resp_buf;
     vq->desc[d1].len = (uint32_t)resp_sz;
     vq->desc[d1].flags = VRING_DESC_F_WRITE;
     vq->desc[d1].next = 0;
@@ -205,13 +239,26 @@ static int virtgpu_send_command(struct virtio_gpu_device *vgpu, void *cmd, size_
         v_out16(vgpu->io_base, VIRTIO_PCI_QUEUE_NOTIFY, 0);
     }
 
-    /* Wait for completion */
-    int timeout = 100000;
-    while ((vq->used->idx == vq->last_used_idx) && --timeout) {
+    /* Wait for completion using real architectural timer (up to 2.0 seconds) */
+    uint64_t freq = virtgpu_read_timer_freq();
+    if (freq == 0) freq = 62500000ULL;
+    uint64_t max_ticks = freq * 2; /* 2.0s */
+    uint64_t start = virtgpu_read_timer();
+    bool completed = false;
+
+    while (virtgpu_read_timer() - start < max_ticks) {
+        if (vq->used->idx != vq->last_used_idx) {
+            completed = true;
+            break;
+        }
         __asm__ volatile("yield");
     }
-    if (timeout > 0) {
+
+    if (completed) {
         vq->last_used_idx = vq->used->idx;
+        if (resp && resp_sz > 0) {
+            memcpy(resp, s_dma_resp_buf, resp_sz);
+        }
     } else {
         struct virtio_gpu_ctrl_hdr *h = (struct virtio_gpu_ctrl_hdr *)cmd;
         if (resp && resp_sz >= sizeof(struct virtio_gpu_ctrl_hdr)) {
@@ -225,7 +272,9 @@ static int virtgpu_send_command(struct virtio_gpu_device *vgpu, void *cmd, size_
     if (vgpu->isr_cfg) {
         (void)v_in8(vgpu->isr_cfg, 0);
     }
-    return 0;
+
+    spin_unlock_irqrestore(&s_cmd_lock, flags);
+    return completed ? 0 : -EIO;
 }
 
 /* =========================================================================
@@ -386,15 +435,6 @@ static struct drm_driver s_virtgpu_drm_driver = {
     .ioctl = virtgpu_drm_ioctl,
 };
 
-static int virtgpu_irq_handler(uint32_t vector, void *arg)
-{
-    (void)vector;
-    struct virtio_gpu_device *vgpu = (struct virtio_gpu_device *)arg;
-    if (vgpu && vgpu->isr_cfg) {
-        (void)v_in8(vgpu->isr_cfg, 0);
-    }
-    return 1;
-}
 
 static int virtgpu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
@@ -443,9 +483,8 @@ static int virtgpu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *e
         pos = pci_read_config_byte(pdev, pos + 1) & ~0x03;
     }
 
-    if (pdev->irq > 0) {
-        arch_irq_register(pdev->irq, virtgpu_irq_handler, &s_virtgpu_dev);
-    }
+    /* Note: VirtIO-GPU operations are synchronously polled via virtgpu_send_command.
+     * Do not register pdev->irq here to avoid hijacking shared PCI INTx lines (e.g. IRQ 36 shared with SDHCI). */
 
     /* Setup Virtqueues */
     virtgpu_vring_setup(&s_virtgpu_dev.ctrl_vq, VIRTIO_GPU_QUEUE_SIZE);
@@ -506,7 +545,6 @@ static int virtgpu_pci_probe(struct pci_dev *pdev, const struct pci_device_id *e
         pr_info("cherry_drm: virtio-gpu virtual display engine initialized\n");
     }
 
-    /* Query display modes */
     virtgpu_get_display_info(&s_virtgpu_dev);
 
     /* Initialize DRM KMS & GEM state */
@@ -580,7 +618,13 @@ static struct pci_driver s_virtgpu_pci_driver = {
 
 int cherry_virtio_gpu_init(void)
 {
-    /* Always register virtual fallback DRM device if PCI bus not yet ready */
+    /* 1. Register PCI VirtIO-GPU driver first */
+    int ret = pci_register_driver(&s_virtgpu_pci_driver);
+    if (s_virtgpu_dev.hardware_ready) {
+        return ret;
+    }
+
+    /* 2. Fallback virtual display engine only if no hardware VirtIO GPU was detected */
     if (!s_virtgpu_drm.name) {
         memset(&s_virtgpu_drm, 0, sizeof(s_virtgpu_drm));
         s_virtgpu_drm.name = "virtio_gpu";
@@ -626,7 +670,7 @@ int cherry_virtio_gpu_init(void)
         cherry_fbdev_init(&s_virtgpu_drm);
     }
 
-    return pci_register_driver(&s_virtgpu_pci_driver);
+    return ret;
 }
 
 struct drm_device *cherry_virtio_gpu_get_device(void)
